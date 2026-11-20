@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Hestia Control Panel upgrade script for target version 1.10.0
+# Hestia Control Panel upgrade script for target version 1.10.10
 
 #######################################################################################
 #######                      Place additional commands below.                   #######
@@ -20,234 +20,95 @@
 upgrade_config_set_value 'UPGRADE_UPDATE_WEB_TEMPLATES' 'false'
 upgrade_config_set_value 'UPGRADE_UPDATE_DNS_TEMPLATES' 'false'
 upgrade_config_set_value 'UPGRADE_UPDATE_FILEMANAGER_CONFIG' 'false'
-upgrade_config_set_value 'UPGRADE_UPDATE_MAIL_TEMPLATES' 'true'
-upgrade_config_set_value 'UPGRADE_REBUILD_USERS' 'true'
+upgrade_config_set_value 'UPGRADE_UPDATE_MAIL_TEMPLATES' 'false'
+upgrade_config_set_value 'UPGRADE_REBUILD_USERS' 'false'
 
-# fix/file manager ignores user language
-echo "[ * ] Fix File Manager ignoring user language"
-cp -f "$HESTIA"/install/deb/filemanager/filegator/configuration.php "$HESTIA"/web/fm/configuration.php
+# Fix per-domain SMTP relay lookup for authenticated null-sender mail on existing Exim installations
+exim_conf="${exim_conf:-/etc/exim4/exim4.conf.template}"
+exim_conf_bak="${exim_conf}.before_smtp_relay_null_sender.bak"
+pattern_dsearch='SMTP_RELAY_FILE = ${if exists{/etc/exim4/domains/${lookup{$sender_address_domain}dsearch{/etc/exim4/domains}}/smtp_relay.conf}{/etc/exim4/domains/${lookup{$sender_address_domain}dsearch{/etc/exim4/domains}}/smtp_relay.conf}{/etc/exim4/smtp_relay.conf}}'
+pattern_legacy='SMTP_RELAY_FILE = ${if exists{/etc/exim4/domains/${sender_address_domain}/smtp_relay.conf}{/etc/exim4/domains/$sender_address_domain/smtp_relay.conf}{/etc/exim4/smtp_relay.conf}}'
+# NOTE: no ":" may appear in the new block (SMTP_RELAY_FILE is used inside colon-separated
+# lists such as require_files), hence eq{}{} instead of def:.
+new_block='RELAY_SENDER_DOMAIN = ${if eq{$sender_address_domain}{}{${extract{2}{@}{$authenticated_id}}}{$sender_address_domain}}
+RELAY_DOMAIN_DIR = /etc/exim4/domains/${lookup{RELAY_SENDER_DOMAIN}dsearch{/etc/exim4/domains}}
+SMTP_RELAY_FILE = ${if exists{RELAY_DOMAIN_DIR/smtp_relay.conf}{RELAY_DOMAIN_DIR/smtp_relay.conf}{/etc/exim4/smtp_relay.conf}}'
 
-if [ -f /etc/os-release ]; then
-	# /etc/os-release defines its own $VERSION, which would otherwise
-	# clobber Hestia's $VERSION since this script is sourced by the caller
-	_HESTIA_VERSION="$VERSION"
-	source /etc/os-release
-	VERSION="$_HESTIA_VERSION"
-	unset _HESTIA_VERSION
-fi
+if [[ -f "$exim_conf" ]] \
+	&& ! grep -qE '^RELAY_(SENDER_DOMAIN|DOMAIN_DIR)[[:space:]]*=' "$exim_conf" \
+	&& { grep -qFx "$pattern_dsearch" "$exim_conf" || grep -qFx "$pattern_legacy" "$exim_conf"; }; then
+	echo "[ + ] Fixing per-domain SMTP relay lookup for null-sender mail in Exim"
 
-# Set running OS
-IS_DEBIAN13=false
-IS_UBUNTU2604=false
-IS_DEBIAN13_OR_UBUNTU2604=false
+	cp -p "$exim_conf" "$exim_conf_bak"
+	exim_conf_tmp="$(mktemp "${exim_conf}.XXXXXX")"
 
-if [[ "$ID" == "debian" && "$VERSION_ID" == "13" ]]; then
-	IS_DEBIAN13=true
-fi
+	# Exact whole-line match in awk (no regex/escaping issues); values go through
+	# ENVIRON so backslashes and special characters are kept untouched.
+	PAT1="$pattern_dsearch" PAT2="$pattern_legacy" NEW="$new_block" \
+		awk '$0 == ENVIRON["PAT1"] || $0 == ENVIRON["PAT2"] { print ENVIRON["NEW"]; next } { print }' \
+		"$exim_conf" > "$exim_conf_tmp"
+	cat "$exim_conf_tmp" > "$exim_conf" # keep original owner/permissions
+	rm -f "$exim_conf_tmp"
 
-if [[ "$ID" == "ubuntu" && "$VERSION_ID" == "26.04" ]]; then
-	IS_UBUNTU2604=true
-fi
-
-if $IS_DEBIAN13 || $IS_UBUNTU2604; then
-	IS_DEBIAN13_OR_UBUNTU2604=true
-fi
-
-# Apply SSH config if running on Debian 13 or Ubuntu 26.04
-if $IS_DEBIAN13_OR_UBUNTU2604; then
-	_KEX_CONF="/etc/ssh/sshd_config.d/hestia-kex.conf"
-	_KEX_LINE="KexAlgorithms +diffie-hellman-group-exchange-sha256"
-
-	# Only create/modify the file if it doesn't already contain the correct config
-	if [[ ! -f "$_KEX_CONF" ]] || ! grep -qxF "$_KEX_LINE" "$_KEX_CONF"; then
-		echo "[ * ] Creating $_KEX_CONF"
-		echo "$_KEX_LINE" > "$_KEX_CONF"
-		"$BIN"/v-restart-service ssh
-	fi
-fi
-
-# Fix: migrate SnappyMail data directory /etc/snappymail/data to /var/lib/snappymail/data
-SNAPPYMAIL_ETC_DIR="/etc/snappymail"
-SNAPPYMAIL_ETC_DATA="/etc/snappymail/data"
-SNAPPYMAIL_VAR_DATA="/var/lib/snappymail/data"
-if [[ -d "$SNAPPYMAIL_ETC_DATA" ]] && ! [[ -L "$SNAPPYMAIL_ETC_DATA" ]]; then
-	echo "[ * ] Migrating SnappyMail data directory to '$SNAPPYMAIL_VAR_DATA'"
-	if [ -L "$SNAPPYMAIL_VAR_DATA" ]; then
-		echo "[ * ] Removing existing symlink at '$SNAPPYMAIL_VAR_DATA'"
-		rm -f "$SNAPPYMAIL_VAR_DATA"
-		echo "[ * ] Moving '$SNAPPYMAIL_ETC_DATA' to '$SNAPPYMAIL_VAR_DATA'"
-		if ! mv "$SNAPPYMAIL_ETC_DATA" "$SNAPPYMAIL_VAR_DATA"; then
-			echo "[ ! ] Failed to move '$SNAPPYMAIL_ETC_DATA' to '$SNAPPYMAIL_VAR_DATA'. Skipping cleanup."
-		else
-			echo "[ * ] Removing '$SNAPPYMAIL_ETC_DIR' directory"
-			if ! rm -rf "$SNAPPYMAIL_ETC_DIR"; then
-				echo "[ ! ] Failed to remove '$SNAPPYMAIL_ETC_DIR'."
-			else
-				echo "[ * ] SnappyMail data directory migration completed successfully"
-			fi
-		fi
+	if systemctl restart exim4; then
+		echo "[ + ] Exim4 restarted successfully"
 	else
-		echo "[ * ] '$SNAPPYMAIL_VAR_DATA' is not a symlink. Skipping SnappyMail data migration."
-	fi
-fi
+		echo "[ ! ] Exim4 failed to restart, rolling back configuration"
 
-# If Dovecot is version 2.4 and OS is Trixie (13) or Ubuntu 26.04, replace Dovecot's configuration and rebuild users
-if command -v dovecot &> /dev/null; then
-	dovecot_version="$(dovecot --version | cut -f -2 -d .)"
-else
-	dovecot_version=false
-fi
+		if [[ -f "$exim_conf_bak" ]]; then
+			mv "$exim_conf_bak" "$exim_conf"
 
-if $IS_DEBIAN13_OR_UBUNTU2604 && [[ "$dovecot_version" = "2.4" ]]; then
-	if ! grep -q 'modified by Hestia' /etc/dovecot/dovecot.conf \
-		|| ! grep -q 'ssl_server_cert_file = /usr/local/hestia' /etc/dovecot/conf.d/10-ssl.conf; then
-		echo "[ * ] Updating Dovecot $dovecot_version configuration"
-		cp -f "$HESTIA_COMMON_DIR"/dovecot/2.4/dovecot.conf /etc/dovecot/
-		cp -f "$HESTIA_COMMON_DIR"/dovecot/2.4/conf.d/* /etc/dovecot/conf.d/
-
-		# rebuild users to apply new dovecot conf
-		upgrade_config_set_value 'UPGRADE_REBUILD_USERS' 'true'
-
-		# if sieve is installed, replace dovecot conf files
-		HAS_DOVECOT_SIEVE_INSTALLED=$(dpkg --get-selections dovecot-managesieved 2> /dev/null | grep -c dovecot-managesieved)
-		if [[ "$HAS_DOVECOT_SIEVE_INSTALLED" = "1" ]]; then
-			echo "[ * ] Updating Sieve $dovecot_version configuration"
-			# dovecot.conf install
-			sed -i -E 's/protocols = imap/protocols = sieve imap/' /etc/dovecot/dovecot.conf
-			#  10-master.conf
-			sed -i -E -z 's/    user = dovecot\n  \}\n\}/    user = dovecot\n  \}\n\n  unix_listener auth-master {\n    group = mail\n    mode = 0660\n    user = dovecot\n  }\n\}/' /etc/dovecot/conf.d/10-master.conf
-			#  15-lda.conf
-			sed -i '/^protocol lda {$/a\  mail_plugins = mail_compress quota sieve' /etc/dovecot/conf.d/15-lda.conf
-			#  20-imap.conf
-			sed -i "s/quota imap_quota/quota imap_quota imap_sieve/g" /etc/dovecot/conf.d/20-imap.conf
-			# replace dovecot-sieve config files
-			cp -f "$HESTIA_COMMON_DIR"/dovecot/2.4/sieve/* /etc/dovecot/conf.d
-		fi
-		chown -R root:root /etc/dovecot/
-	fi
-fi
-
-# Configure Bind for Debian 13 or Ubuntu 26.04
-if $IS_DEBIAN13_OR_UBUNTU2604; then
-	source "$HESTIA"/conf/hestia.conf
-	if [[ "$DNS_SYSTEM" =~ named|bind ]]; then
-		# named.conf.default-zones was removed in Debian 13
-		if [[ ! -f /etc/bind/named.conf.default-zones ]] \
-			&& grep -q "include.*named.conf.default-zones" /etc/bind/named.conf 2> /dev/null; then
-			echo "[ + ] Removing the default-zones include from named.conf"
-			sed -i "/^include.*named.conf.default-zones/d" /etc/bind/named.conf
-		fi
-
-		# Add root-hints include after named.conf.local if missing
-		if [[ -f /etc/bind/named.conf.root-hints ]] \
-			&& ! grep -q 'include.*named.conf.root-hints' /etc/bind/named.conf 2> /dev/null; then
-			echo "[ + ] Adding the root-hints include to named.conf"
-			sed -i '/include.*named\.conf\.local/a include "\/etc\/bind\/named.conf.root-hints";' /etc/bind/named.conf
-		fi
-	fi
-fi
-
-# Fix old source.list for Node.js and bump to version 24
-apt="/etc/apt/sources.list.d"
-node_v=24
-
-if [ $(uname -m) = "x86_64" ]; then
-	ARCH=amd64
-elif [ $(uname -m) = "aarch64" ]; then
-	ARCH=arm64
-fi
-
-if [[ -f "$apt/nodejs.list" ]]; then
-	echo "[ * ] Modifying Node.js repo to version $node_v"
-	echo "deb [arch=$ARCH signed-by=/usr/share/keyrings/nodejs.gpg] https://deb.nodesource.com/node_$node_v.x nodistro main" > "$apt"/nodejs.list
-	curl -fsSLm60 https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor | tee /usr/share/keyrings/nodejs.gpg > /dev/null 2>&1
-fi
-
-# Fixing Subsystem sftp config for old installations
-echo "[ * ] Fixing Subsystem sftp config"
-if grep -q "^Subsystem.*internal-sftp-.*" /etc/ssh/sshd_config; then
-	sed -i 's/Subsystem sftp internal-sftp-.*/Subsystem sftp internal-sftp/' /etc/ssh/sshd_config
-	systemctl reload ssh
-fi
-
-if grep -q "^Subsystem.*/usr/lib/sftp-server-" /etc/ssh/sshd_config; then
-	sed -i 's/^Subsystem sftp \/usr\/lib\/sftp-server-.*/Subsystem sftp \/usr\/lib\/sftp-server/' /etc/ssh/sshd_config
-	systemctl reload ssh
-fi
-
-# Move phpMyAdmin tmp dir to /var/lib/phpmyadmin/tmp
-phpmyadmin_conf="/etc/phpmyadmin/conf.d/01-localhost.php"
-phpmyadmin_tempdir_conf="/etc/phpmyadmin/conf.d/02-tempdir.php"
-
-if [[ -f "$phpmyadmin_conf" ]]; then
-	mkdir -p /var/lib/phpmyadmin/tmp/
-	chown -R hestiamail:www-data /var/lib/phpmyadmin/tmp/
-	if [[ ! -f "$phpmyadmin_tempdir_conf" ]]; then
-		cat > "$phpmyadmin_tempdir_conf" << 'EOF'
-<?php
-$cfg['TempDir'] = '/var/lib/phpmyadmin/tmp';
-EOF
-	fi
-fi
-
-# Patch Spamhaus DQS key leak in existing exim templates
-echo "[ * ] Patching Exim Spamhaus DQS configuration"
-if [ -f "/etc/exim4/exim4.conf.template" ]; then
-	sed -i 's|at $dnslist_domain\\n$dnslist_text|at ${if match{$dnslist_domain}{^[^.]+[.](.+dq[.]spamhaus.*)}{$1}{$dnslist_domain}}\\n$dnslist_text|g' /etc/exim4/exim4.conf.template
-fi
-
-# Configuring sudoers to remove unsupported requiretty option on Ubuntu 26.04
-if $IS_UBUNTU2604; then
-	if [[ -f /etc/sudoers.d/hestiaweb ]] && grep -q '^Defaults:root !requiretty$' /etc/sudoers.d/hestiaweb &> /dev/null; then
-		echo "[ + ] Configuring sudoers to remove unsupported requiretty option"
-		chmod 640 /etc/sudoers.d/hestiaweb
-		sed -i '/^Defaults:root !requiretty$/d' /etc/sudoers.d/hestiaweb
-		chmod 440 /etc/sudoers.d/hestiaweb
-	fi
-fi
-
-# Updating logrotate conf for Hestia
-echo "[ * ] Updating logrotate conf for Hestia"
-cp -f "$HESTIA"/install/deb/logrotate/hestia /etc/logrotate.d/hestia
-
-# Enhance - Update current composer installations
-echo "[ * ] Updating composer for users:"
-for huser in $("$HESTIA/bin/v-list-users" list); do
-	if [[ -f "/home/$huser/.composer/composer" ]]; then
-		echo "      - $huser..."
-		"$HESTIA/bin/v-add-user-composer" "$huser" 2 yes &> /dev/null
-	fi
-done
-
-# If Dovecot 2.4, modify the local delivery directives in Exim"
-echo "[ * ] Updating Exim configuration:"
-if [[ $MAIL_SYSTEM == exim4 ]] \
-	&& [[ $(dovecot --version) == 2.4* ]] \
-	&& [[ -f /etc/exim4/exim4.conf.template ]]; then
-	sed -i.bak '
-s#  directory = "${extract{5}{:}{${lookup{$local_part}lsearch{/etc/exim4/domains/${lookup{$domain}dsearch{/etc/exim4/domains/}}/passwd}}}}/mail/${lookup{$domain}dsearch{/etc/exim4/domains/}}/${lookup{$local_part}dsearch{${extract{5}{:}{${lookup{$local_part}lsearch{/etc/exim4/domains/${lookup{$domain}dsearch{/etc/exim4/domains/}}/passwd}}}}/mail/${lookup{$domain}dsearch{/etc/exim4/domains/}}}}"#  directory = "${extract{5}{:}{${lookup{$local_part}lsearch{/etc/exim4/domains/${lookup{$domain}dsearch{/etc/exim4/domains/}}/passwd}}}}"#
-
-s#  directory = "${extract{5}{:}{${lookup{$local_part}lsearch{/etc/exim4/domains/${lookup{$domain}dsearch{/etc/exim4/domains/}}/passwd}}}}/mail/${lookup{$domain}dsearch{/etc/exim4/domains/}}/${lookup{$local_part}dsearch{${extract{5}{:}{${lookup{$local_part}lsearch{/etc/exim4/domains/${lookup{$domain}dsearch{/etc/exim4/domains/}}/passwd}}}}/mail/${lookup{$domain}dsearch{/etc/exim4/domains/}}}}/.Spam"#  directory = "${extract{5}{:}{${lookup{$local_part}lsearch{/etc/exim4/domains/${lookup{$domain}dsearch{/etc/exim4/domains/}}/passwd}}}}/.Spam"#
-
-s#  quota_directory = "${extract{5}{:}{${lookup{$local_part}lsearch{/etc/exim4/domains/${lookup{$domain}dsearch{/etc/exim4/domains/}}/passwd}}}}/mail/${lookup{$domain}dsearch{/etc/exim4/domains/}}/${lookup{$local_part}dsearch{${extract{5}{:}{${lookup{$local_part}lsearch{/etc/exim4/domains/${lookup{$domain}dsearch{/etc/exim4/domains/}}/passwd}}}}/mail/${lookup{$domain}dsearch{/etc/exim4/domains/}}}}"#  quota_directory = "${extract{5}{:}{${lookup{$local_part}lsearch{/etc/exim4/domains/${lookup{$domain}dsearch{/etc/exim4/domains/}}/passwd}}}}"#
-' /etc/exim4/exim4.conf.template
-	if ! cmp -s /etc/exim4/exim4.conf.template{.bak,}; then
-		echo "[ + ] Local delivery directives fixed in Exim configuration"
-		if systemctl restart exim4 &> /dev/null; then
-			echo "[ + ] Exim successfully restarted"
-		else
-			echo "[ ! ] Error restarting Exim" >&2
-			systemctl status exim4 --no-pager -l >&2
-			echo "[ + ] Recovering configuration backup"
-			cp -f /etc/exim4/exim4.conf.template.bak /etc/exim4/exim4.conf.template
-			if systemctl restart exim4 &> /dev/null; then
-				echo "[ + ] Exim successfully restarted after recovery"
+			if systemctl restart exim4; then
+				echo "[ + ] Exim4 restarted successfully after rollback"
 			else
-				echo "[ ! ] Error restarting Exim after recovery" >&2
-				systemctl status exim4 --no-pager -l >&2
+				echo "[ ! ] Exim4 failed to restart even after rollback"
 			fi
+		else
+			echo "[ ! ] Backup file not found, unable to rollback"
 		fi
-	else
-		echo "[ * ] Exim configuration already up to date"
 	fi
+fi
+
+# HTTP/3 (QUIC): set "reuseport" once per IP in /etc/nginx/conf.d/<ip>.conf instead of in
+# the first domain config on that IP. Before, the option disappeared whenever that domain
+# was deleted, suspended or moved to another template, and nginx workers then dropped
+# QUIC packets meant for each other, so HTTP/3 page loads stalled.
+if { [ "$WEB_SYSTEM" = "nginx" ] || [ "$PROXY_SYSTEM" = "nginx" ]; } \
+	&& nginx -V 2>&1 | grep -q 'http_v3_module'; then
+	echo "[ * ] Moving HTTP/3 (QUIC) reuseport option to the nginx IP configuration"
+	# shellcheck source=/usr/local/hestia/func/domain.sh
+	source $HESTIA/func/domain.sh
+
+	# Remove the old per-template hooks that added reuseport to a single domain
+	rm -f "$HESTIA"/data/templates/web/nginx/php-fpm/wordpress-http3.sh \
+		"$HESTIA"/data/templates/web/nginx/php-fpm/wordpress-disable-xmlrpc-http3.sh \
+		"$HESTIA"/data/templates/web/nginx/php-fpm/wordpress_mu_subdir-http3.sh
+
+	quic_bak_dir="$(mktemp -d)"
+	quic_changed=()
+	while IFS= read -r ip; do
+		ip_conf="/etc/nginx/conf.d/$ip.conf"
+		[ -f "$ip_conf" ] || continue
+		for conf in "$ip_conf" $(grep -lE "^\s*listen\s+${ip//./\\.}:[0-9]+\s+quic\s+reuseport\b" "$HOMEDIR"/*/conf/web/*/nginx.ssl.conf 2> /dev/null); do
+			cp -p "$conf" "$quic_bak_dir/${#quic_changed[@]}"
+			quic_changed+=("$conf")
+		done
+		process_quic_reuseport_ip "$ip_conf"
+		for conf in "${quic_changed[@]}"; do
+			[ "$conf" = "$ip_conf" ] || process_quic_reuseport_domain "$conf" "$ip"
+		done
+	done < <(ls "$HESTIA"/data/ips/ 2> /dev/null)
+
+	if nginx -t > /dev/null 2>&1; then
+		# A restart, not a reload, so nginx opens one UDP socket per worker
+		systemctl restart nginx
+	else
+		echo "[ ! ] nginx configuration test failed, restoring previous HTTP/3 configuration"
+		for i in "${!quic_changed[@]}"; do
+			cp -p "$quic_bak_dir/$i" "${quic_changed[$i]}"
+		done
+		add_upgrade_message "HTTP/3: the QUIC reuseport option could not be moved to /etc/nginx/conf.d/<ip>.conf because the nginx configuration test failed. Your previous configuration was restored. Run 'nginx -t' for details."
+	fi
+	rm -rf "$quic_bak_dir"
+	unset ip ip_conf conf quic_bak_dir quic_changed i
 fi
